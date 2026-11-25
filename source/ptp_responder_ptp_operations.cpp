@@ -18,6 +18,7 @@
 #include <haze/ptp_data_parser.hpp>
 #include <haze/ptp_responder_types.hpp>
 #include "haze/threaded_file_transfer.hpp"
+#include <limits>
 
 namespace haze {
 
@@ -482,98 +483,127 @@ namespace haze {
         R_UNLESS(data_header.code == m_request_header.code,         haze::ResultOperationNotSupported());
         R_UNLESS(data_header.trans_id == m_request_header.trans_id, haze::ResultOperationNotSupported());
 
-        /* Check if we know about the object. If we don't, it's an error. */
-        auto * const obj = m_object_database.GetObjectById(m_send_object_id);
-        R_UNLESS(obj != nullptr, haze::ResultInvalidObjectId());
-        log_write("\n\n\nReceiving object %u (%s)\n", m_send_object_id, obj->GetName());
+        bool finalized = false;
+        const Result rc = [&]() -> Result {
+            /* Check if we know about the object. If we don't, it's an error. */
+            auto * const obj = m_object_database.GetObjectById(m_send_object_id);
+            R_UNLESS(obj != nullptr, haze::ResultInvalidObjectId());
+            log_write("\n\n\nReceiving object %u (%s)\n", m_send_object_id, obj->GetName());
 
-        /* Lock the object as a file. */
-        File file;
-        R_TRY(Fs(obj).OpenFile(obj->GetName(), FileOpenMode_WRITE, std::addressof(file)));
-        log_write("Opened file %s\n", obj->GetName());
+            /* Lock the object as a file. */
+            File file;
+            R_TRY(Fs(obj).OpenFile(obj->GetName(), FileOpenMode_WRITE, std::addressof(file)));
+            log_write("Opened file %s\n", obj->GetName());
 
-        /* Ensure we maintain a clean state on exit. */
-        ON_SCOPE_EXIT { Fs(obj).CloseFile(std::addressof(file)); };
+            /* Ensure we maintain a clean state on exit. */
+            ON_SCOPE_EXIT { Fs(obj).CloseFile(std::addressof(file)); };
 
-        /* Dummy file size for the threaded transfer. */
-        u64 file_size = 4_GB;
-        u64 expected_file_size = 0;
-        u64 offset = 0;
+            /* Dummy file size for the threaded transfer when length is unknown (>4GB). */
+            s64 file_size = std::numeric_limits<s64>::max();
+            u64 expected_file_size = 0;
+            u64 offset = 0;
 
-        if (m_send_prop_list) {
-            file_size = m_send_prop_list->size;
-            expected_file_size = file_size;
-            log_write("File size from property list: %ld\n", file_size);
-        } else {
-            if (data_header.length >= sizeof(PtpUsbBulkContainer)) {
-                /* Got the real file size. */
-                file_size = data_header.length - sizeof(PtpUsbBulkContainer);
-                expected_file_size = file_size;
-                log_write("File size from data header: %ld\n", file_size);
+            if (m_send_prop_list) {
+                file_size = static_cast<s64>(std::min<u64>(m_send_prop_list->size, std::numeric_limits<s64>::max()));
+                expected_file_size = m_send_prop_list->size;
+                log_write("File size from property list: %llu\n", static_cast<unsigned long long>(expected_file_size));
             } else {
-                log_write("File size unknown, starting at 0\n");
+                if (data_header.length >= sizeof(PtpUsbBulkContainer) && data_header.length != 0xFFFFFFFFu) {
+                    /* Got the real file size. */
+                    file_size = static_cast<s64>(data_header.length - sizeof(PtpUsbBulkContainer));
+                    expected_file_size = static_cast<u64>(file_size);
+                    log_write("File size from data header: %llu\n", static_cast<unsigned long long>(expected_file_size));
+                } else {
+                    log_write("File size unknown (header length 0x%08x), streaming until EOT\n", data_header.length);
+                }
             }
-        }
 
-        /* Truncate the file to the received size. */
-        ON_SCOPE_EXIT{
-            if (offset < expected_file_size) {
-                R_DISCARD(Fs(obj).SetFileSize(std::addressof(file), offset));
+            /* Truncate the file to the received size. */
+            ON_SCOPE_EXIT {
+                if (offset < expected_file_size) {
+                    R_DISCARD(Fs(obj).SetFileSize(std::addressof(file), offset));
+                }
+            };
+
+            WriteCallbackFile(CallbackType_WriteBegin, obj->GetName());
+            ON_SCOPE_EXIT { WriteCallbackFile(CallbackType_WriteEnd, obj->GetName()); };
+
+            bool is_done = false;
+
+            R_TRY(sphaira::thread::Transfer(file_size,
+                [&dp, &is_done](void* data, s64 off, s64 size, u64* bytes_read) -> Result {
+                    if (is_done) {
+                        *bytes_read = 0;
+                        R_SUCCEED();
+                    }
+
+                    /* Read as many bytes as we can. */
+                    u32 bytes_received;
+                    log_write("Reading up to %ld bytes at offset %ld\n", size, off);
+                    const Result read_res = dp.ReadBuffer((u8*)data, size, std::addressof(bytes_received));
+                    log_write("Received %u bytes\n", bytes_received);
+                    *bytes_read = bytes_received;
+
+                    /* If we received fewer bytes than the batch size, we're done. */
+                    if (haze::ResultEndOfTransmission::Includes(read_res)) {
+                        is_done = true;
+                        R_SUCCEED();
+                    }
+
+                    R_RETURN(read_res);
+                },
+                [this, &file, &obj, &offset, expected_file_size](const void* data, s64 off, s64 size) -> Result {
+                    /* Write to the file. */
+                    // during the first write, set the file size (if possible).
+                    // the reason we do this here is so that we do not block for too long
+                    // as windows will freeze if we take 3s+ between usb transfers.
+                    if (!off && expected_file_size) {
+                        log_write("Setting file size to %ld\n", expected_file_size);
+                        R_TRY(Fs(obj).SetFileSize(std::addressof(file), expected_file_size));
+                    }
+
+                    log_write("Writing %ld bytes at offset %ld\n", size, off);
+                    R_TRY(Fs(obj).WriteFile(std::addressof(file), off, data, size));
+                    log_write("Wrote %ld bytes at offset %ld\n", size, off);
+                    WriteCallbackProgress(CallbackType_WriteProgress, off, size);
+                    offset += size;
+                    R_SUCCEED();
+                }, sphaira::thread::BUFFER_SIZE_WRITE
+            ));
+
+            log_write("Received object %u (%s), total size %ld\n\n\n", m_send_object_id, obj->GetName(), offset);
+
+            /* Read the trailing zero-length packet if the data ended on a packet boundary. */
+            R_TRY(dp.Finalize());
+            finalized = true;
+
+            /* Wait for any deferred install/commit before reporting success to the host. */
+            R_RETURN(Fs(obj).CommitFile(std::addressof(file)));
+        }();
+
+        /* Drain remaining Bulk OUT data on recoverable filesystem/object errors so the USB pipe stays synced. */
+        R_TRY_CATCH(rc) {
+            R_CATCH_MODULE(fs) {
+                if (!finalized) {
+                    const Result drain_rc = dp.Finalize();
+                    finalized = true;
+                    if (haze::ResultStopRequested::Includes(drain_rc) || haze::ResultFocusLost::Includes(drain_rc)) {
+                        R_RETURN(drain_rc);
+                    }
+                }
+                R_THROW(R_CURRENT_RESULT);
             }
-        };
-
-        WriteCallbackFile(CallbackType_WriteBegin, obj->GetName());
-        ON_SCOPE_EXIT { WriteCallbackFile(CallbackType_WriteEnd, obj->GetName()); };
-
-        bool is_done = false;
-
-        R_TRY(sphaira::thread::Transfer(file_size,
-            [this, &dp, &is_done](void* data, s64 off, s64 size, u64* bytes_read) -> Result {
-                if (is_done) {
-                    *bytes_read = 0;
-                    R_SUCCEED();
+            R_CATCH(haze::ResultInvalidObjectId, haze::ResultInvalidArgument, haze::ResultDeviceBusy) {
+                if (!finalized) {
+                    const Result drain_rc = dp.Finalize();
+                    finalized = true;
+                    if (haze::ResultStopRequested::Includes(drain_rc) || haze::ResultFocusLost::Includes(drain_rc)) {
+                        R_RETURN(drain_rc);
+                    }
                 }
-
-                /* Read as many bytes as we can. */
-                u32 bytes_received;
-                log_write("Reading up to %ld bytes at offset %ld\n", size, off);
-                const Result read_res = dp.ReadBuffer((u8*)data, size, std::addressof(bytes_received));
-                log_write("Received %u bytes\n", bytes_received);
-                *bytes_read = bytes_received;
-
-                /* If we received fewer bytes than the batch size, we're done. */
-                if (haze::ResultEndOfTransmission::Includes(read_res)) {
-                    is_done = true;
-                    R_SUCCEED();
-                }
-
-                R_RETURN(read_res);
-            },
-            [this, &file, &obj, &offset, expected_file_size](const void* data, s64 off, s64 size) -> Result {
-                /* Write to the file. */
-                // during the first write, set the file size (if possible).
-                // the reason we do this here is so that we do not block for too long
-                // as windows will freeze if we take 3s+ between usb transfers.
-                if (!off && expected_file_size) {
-                    log_write("Setting file size to %ld\n", expected_file_size);
-                    R_TRY(Fs(obj).SetFileSize(std::addressof(file), expected_file_size));
-                }
-
-                log_write("Writing %ld bytes at offset %ld\n", size, off);
-                R_TRY(Fs(obj).WriteFile(std::addressof(file), off, data, size));
-                log_write("Wrote %ld bytes at offset %ld\n", size, off);
-                WriteCallbackProgress(CallbackType_WriteProgress, off, size);
-                offset += size;
-                R_SUCCEED();
-            }, sphaira::thread::BUFFER_SIZE_WRITE
-        ));
-
-        /* Write the success response. */
-        // note: it can timeout here if the final write takes too long.
-        log_write("Received object %u (%s), total size %ld\n\n\n", m_send_object_id, obj->GetName(), offset);
-
-        /* Read the trailing zero-length packet if the data ended on a packet boundary. */
-        R_TRY(dp.Finalize());
+                R_THROW(R_CURRENT_RESULT);
+            }
+        } R_END_TRY_CATCH;
 
         R_RETURN(this->WriteResponse(PtpResponseCode_Ok));
     }
